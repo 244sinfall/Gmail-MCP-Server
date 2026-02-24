@@ -1,27 +1,30 @@
-FROM node:20-slim
+# Build stage: compile TypeScript to dist/
+FROM node:20-slim AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --ignore-scripts
+COPY . .
+RUN npm run build
 
+# Runtime stage: production deps + compiled output
+FROM node:20-slim AS runtime
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
+COPY package*.json ./
+RUN npm ci --omit=dev --ignore-scripts
 
-# Copy source files and config first
-COPY tsconfig.json ./
-COPY src ./src
+COPY --from=build /app/dist ./dist
 
-# Install dependencies (which will trigger build via prepare script)
-RUN npm ci
+RUN mkdir -p /config
 
-# Create directory for credentials and config
-RUN mkdir -p /gmail-server /root/.gmail-mcp
-
-# Set environment variables
 ENV NODE_ENV=production
-ENV GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json
-ENV GMAIL_OAUTH_PATH=/root/.gmail-mcp/gcp-oauth.keys.json
+ENV GMAIL_OAUTH_PATH=/config/gcp-oauth.keys.json
+ENV GMAIL_MCP_TOKEN_PATH=/config/tokens.json
+ENV GMAIL_MCP_HOST=0.0.0.0
+ENV GMAIL_MCP_PORT=3000
 
-# Expose port for OAuth flow
 EXPOSE 3000
 
-# Set entrypoint command
-ENTRYPOINT ["node", "dist/index.js"]
+USER node
+
+ENTRYPOINT ["node", "dist/index.js", "start"]

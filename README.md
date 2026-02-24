@@ -1,6 +1,6 @@
 # Gmail AutoAuth MCP Server
 
-A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop with auto authentication support. This server enables AI assistants to manage Gmail through natural language interactions.
+A Model Context Protocol (MCP) server for Gmail integration with auto authentication. It is designed for Streamable HTTP deployments used by MCP gateways and remote clients, as well as local use with Claude Desktop.
 
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 [![smithery badge](https://smithery.ai/badge/@gongrzhe/server-gmail-autoauth-mcp)](https://smithery.ai/server/@gongrzhe/server-gmail-autoauth-mcp)
@@ -27,6 +27,22 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 - Simple OAuth2 authentication flow with auto browser launch
 - Support for both Desktop and Web application credentials
 - Global credential storage for convenience
+- **Streamable HTTP transport**: expose MCP over HTTP (`/mcp`) for gateway/upstream architectures
+- **Multi-session support**: one MCP server instance per client session (by `Mcp-Session-Id`)
+- **Persistent single-user auth**: credentials and tokens from env or file; token refresh persisted to file or in-memory
+
+## Quick Start: Streamable HTTP (MCP Gateway)
+
+1. Place OAuth desktop credentials at `~/.gmail-mcp/gcp-oauth.keys.json` or set `GMAIL_OAUTH_PATH` (or use `GMAIL_OAUTH_CREDENTIALS_JSON` / `GMAIL_OAUTH_CREDENTIALS_JSON_BASE64`).
+2. Run browser auth once: `npx @gongrzhe/server-gmail-autoauth-mcp auth`
+3. Start the HTTP MCP server:
+   ```bash
+   export GMAIL_MCP_HOST=127.0.0.1
+   export GMAIL_MCP_PORT=3000
+   export GMAIL_MCP_PATH=/mcp
+   npx @gongrzhe/server-gmail-autoauth-mcp start
+   ```
+4. Health check: `curl http://127.0.0.1:3000/healthz`
 
 ## Installation & Authentication
 
@@ -102,9 +118,24 @@ npx -y @smithery/cli install @gongrzhe/server-gmail-autoauth-mcp --client claude
 }
 ```
 
-### Docker Support
+### Docker (Streamable HTTP)
 
-If you prefer using Docker:
+1. Build: `docker build -t gmail-mcp .`
+2. Auth once on a host with a browser (tokens saved to a file), then copy `gcp-oauth.keys.json` and `tokens.json` to the deployment environment.
+3. Run:
+```bash
+docker run --rm -p 3000:3000 \
+  -v /path/to/gcp-oauth.keys.json:/config/gcp-oauth.keys.json:ro \
+  -v /path/to/tokens.json:/config/tokens.json \
+  -e GMAIL_MCP_HOST=0.0.0.0 \
+  -e GMAIL_MCP_PORT=3000 \
+  -e GMAIL_MCP_PATH=/mcp \
+  gmail-mcp
+```
+
+Optional: pass credentials and tokens via env (e.g. `GMAIL_OAUTH_CREDENTIALS_JSON_BASE64`, `GMAIL_MCP_TOKENS_JSON_BASE64`) for environments that don’t mount files.
+
+### Docker (legacy stdio)
 
 1. Authentication:
 ```bash

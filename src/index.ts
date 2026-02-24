@@ -1,21 +1,24 @@
 #!/usr/bin/env node
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
+    isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from 'googleapis';
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { OAuth2Client } from 'google-auth-library';
+import { OAuth2Client, Credentials } from 'google-auth-library';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import http from 'http';
 import open from 'open';
 import os from 'os';
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
@@ -26,6 +29,22 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+const TOKEN_PATH = process.env.GMAIL_MCP_TOKEN_PATH || CREDENTIALS_PATH;
+
+// HTTP transport config
+const HTTP_HOST = process.env.GMAIL_MCP_HOST || '127.0.0.1';
+const HTTP_PORT = Number.parseInt(process.env.GMAIL_MCP_PORT || '3000', 10);
+const HTTP_PATH = process.env.GMAIL_MCP_PATH || '/mcp';
+const ENABLE_DNS_REBINDING_PROTECTION =
+  (process.env.GMAIL_MCP_ENABLE_DNS_REBINDING_PROTECTION || '').toLowerCase() === 'true';
+const ALLOWED_HOSTS = (process.env.GMAIL_MCP_ALLOWED_HOSTS || '')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.GMAIL_MCP_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((v) => v.trim())
+  .filter(Boolean);
 
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
@@ -56,8 +75,11 @@ interface EmailContent {
     html: string;
 }
 
-// OAuth2 configuration
+// OAuth2 configuration (shared single user across all sessions)
 let oauth2Client: OAuth2Client;
+let gmail: ReturnType<typeof google.gmail> | null = null;
+let usingEnvTokens = false;
+let authenticationPromise: Promise<void> | null = null;
 
 /**
  * Recursively extract email body content from MIME message parts
@@ -93,48 +115,139 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
     return { text: textContent, html: htmlContent };
 }
 
+function parseKeys(keys: any): { client_id: string; client_secret?: string; redirect_uris?: string[] } {
+    const k = keys.installed || keys.web;
+    if (!k || !k.client_id) {
+        throw new Error('Invalid OAuth keys format. Expected "installed" or "web" with client_id.');
+    }
+    return k;
+}
+
+function loadCredentialsFromEnv(): { client_id: string; client_secret?: string; redirect_uris?: string[] } | null {
+    const jsonEnv = process.env.GMAIL_OAUTH_CREDENTIALS_JSON;
+    if (jsonEnv) {
+        try {
+            return parseKeys(JSON.parse(jsonEnv));
+        } catch (e) {
+            throw new Error(`Invalid GMAIL_OAUTH_CREDENTIALS_JSON: ${e instanceof Error ? e.message : e}`);
+        }
+    }
+    const b64 = process.env.GMAIL_OAUTH_CREDENTIALS_JSON_BASE64 || process.env.GMAIL_OAUTH_CREDENTIALS_BASE64;
+    if (b64) {
+        try {
+            const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+            return parseKeys(JSON.parse(decoded));
+        } catch (e) {
+            throw new Error(`Invalid GMAIL_OAUTH_CREDENTIALS_JSON_BASE64: ${e instanceof Error ? e.message : e}`);
+        }
+    }
+    return null;
+}
+
+function loadTokensFromEnv(): Credentials | null {
+    const jsonEnv = process.env.GMAIL_MCP_TOKENS_JSON;
+    if (jsonEnv) {
+        try {
+            const parsed = JSON.parse(jsonEnv);
+            if (!parsed || typeof parsed !== 'object') throw new Error('Token payload must be a JSON object');
+            return parsed;
+        } catch (e) {
+            throw new Error(`Invalid GMAIL_MCP_TOKENS_JSON: ${e instanceof Error ? e.message : e}`);
+        }
+    }
+    const b64 = process.env.GMAIL_MCP_TOKENS_JSON_BASE64 || process.env.GMAIL_MCP_TOKENS_BASE64;
+    if (b64) {
+        try {
+            const decoded = Buffer.from(b64, 'base64').toString('utf-8');
+            const parsed = JSON.parse(decoded);
+            if (!parsed || typeof parsed !== 'object') throw new Error('Token payload must be a JSON object');
+            return parsed;
+        } catch (e) {
+            throw new Error(`Invalid GMAIL_MCP_TOKENS_JSON_BASE64: ${e instanceof Error ? e.message : e}`);
+        }
+    }
+    return null;
+}
+
+function setupTokenRefreshPersistence() {
+    if (!oauth2Client) return;
+    oauth2Client.on('tokens', (newTokens) => {
+        if (usingEnvTokens) {
+            const current = oauth2Client.credentials || {};
+            oauth2Client.setCredentials({
+                ...current,
+                ...newTokens,
+                refresh_token: newTokens.refresh_token || (current as Credentials).refresh_token,
+            });
+            console.error('Tokens refreshed in memory (env token mode). Update GMAIL_MCP_TOKENS_JSON / GMAIL_MCP_TOKENS_JSON_BASE64 to persist.');
+            return;
+        }
+        try {
+            const current = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+            const updated = {
+                ...current,
+                ...newTokens,
+                refresh_token: newTokens.refresh_token || current.refresh_token,
+            };
+            fs.writeFileSync(TOKEN_PATH, JSON.stringify(updated, null, 2), { mode: 0o600 });
+            console.error('Tokens updated and saved to', TOKEN_PATH);
+        } catch (err: any) {
+            if (err?.code === 'ENOENT') {
+                try {
+                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
+                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(newTokens, null, 2), { mode: 0o600 });
+                } catch (e) {
+                    console.error('Error saving initial tokens:', e);
+                }
+            } else {
+                console.error('Error saving updated tokens:', err);
+            }
+        }
+    });
+}
+
 async function loadCredentials() {
     try {
-        // Create config directory if it doesn't exist
-        if (!process.env.GMAIL_OAUTH_PATH && !CREDENTIALS_PATH &&!fs.existsSync(CONFIG_DIR)) {
+        if (!process.env.GMAIL_OAUTH_PATH && !fs.existsSync(CONFIG_DIR)) {
             fs.mkdirSync(CONFIG_DIR, { recursive: true });
         }
 
-        // Check for OAuth keys in current directory first, then in config directory
-        const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
-
-        if (fs.existsSync(localOAuthPath)) {
-            // If found in current directory, copy to config directory
-            fs.copyFileSync(localOAuthPath, OAUTH_PATH);
-            console.log('OAuth keys found in current directory, copied to global config.');
+        let keys: { client_id: string; client_secret?: string; redirect_uris?: string[] };
+        const envKeys = loadCredentialsFromEnv();
+        if (envKeys) {
+            keys = envKeys;
+        } else {
+            const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
+            if (fs.existsSync(localOAuthPath)) {
+                fs.copyFileSync(localOAuthPath, OAUTH_PATH);
+                console.error('OAuth keys found in current directory, copied to global config.');
+            }
+            if (!fs.existsSync(OAUTH_PATH)) {
+                console.error('Error: OAuth keys file not found. Use GMAIL_OAUTH_PATH or place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
+                process.exit(1);
+            }
+            const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+            keys = parseKeys(keysContent);
         }
 
-        if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
-        }
-
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-        const keys = keysContent.installed || keysContent.web;
-
-        if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-            process.exit(1);
-        }
-
-        const callback = process.argv[2] === 'auth' && process.argv[3] 
-        ? process.argv[3] 
-        : "http://localhost:3000/oauth2callback";
+        const callback = process.argv[2] === 'auth' && process.argv[3]
+            ? process.argv[3]
+            : 'http://localhost:3000/oauth2callback';
 
         oauth2Client = new OAuth2Client(
             keys.client_id,
             keys.client_secret,
             callback
         );
+        setupTokenRefreshPersistence();
 
-        if (fs.existsSync(CREDENTIALS_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
+        const envTokens = loadTokensFromEnv();
+        if (envTokens) {
+            usingEnvTokens = true;
+            oauth2Client.setCredentials(envTokens);
+            console.error('Tokens loaded from environment.');
+        } else if (fs.existsSync(TOKEN_PATH)) {
+            const credentials = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
             oauth2Client.setCredentials(credentials);
         }
     } catch (error) {
@@ -175,7 +288,10 @@ async function authenticate() {
             try {
                 const { tokens } = await oauth2Client.getToken(code);
                 oauth2Client.setCredentials(tokens);
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(tokens));
+                if (!usingEnvTokens) {
+                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
+                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+                }
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
@@ -188,6 +304,28 @@ async function authenticate() {
             }
         });
     });
+}
+
+async function ensureAuthenticated(): Promise<void> {
+    if (authenticationPromise) await authenticationPromise;
+    if (gmail) return;
+    authenticationPromise = (async () => {
+        if (oauth2Client.credentials?.refresh_token && !oauth2Client.credentials?.access_token) {
+            await oauth2Client.getAccessToken();
+        }
+        if (!oauth2Client.credentials?.access_token) {
+            throw new Error('Not authenticated. Run: npx gmail-mcp auth (or node dist/index.js auth)');
+        }
+        gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    })();
+    await authenticationPromise;
+    authenticationPromise = null;
+}
+
+async function runAuthCommand(): Promise<never> {
+    await authenticate();
+    console.log('Authentication completed successfully');
+    process.exit(0);
 }
 
 // Schema definitions
@@ -323,25 +461,25 @@ async function main() {
     await loadCredentials();
 
     if (process.argv[2] === 'auth') {
-        await authenticate();
-        console.log('Authentication completed successfully');
-        process.exit(0);
+        try {
+            await runAuthCommand();
+        } catch (err) {
+            console.error('Authentication failed:', err);
+            process.exit(1);
+        }
+        return;
     }
 
-    // Initialize Gmail API
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    // MCP server and handlers (shared by all sessions; gmail is set in ensureAuthenticated)
+    const server = new Server(
+        { name: "gmail", version: "1.0.0" },
+        { capabilities: { tools: {} } }
+    );
 
-    // Server implementation
-    const server = new Server({
-        name: "gmail",
-        version: "1.0.0",
-        capabilities: {
-            tools: {},
-        },
-    });
-
-    // Tool handlers
-    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+    function registerMcpHandlers(s: Server) {
+    s.setRequestHandler(ListToolsRequestSchema, async () => {
+        await ensureAuthenticated();
+        return {
         tools: [
             {
                 name: "send_email",
@@ -439,9 +577,12 @@ async function main() {
                 inputSchema: zodToJsonSchema(DownloadAttachmentSchema),
             },
         ],
-    }))
+    };
+    });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    s.setRequestHandler(CallToolRequestSchema, async (request) => {
+        await ensureAuthenticated();
+        const g = gmail!;
         const { name, arguments: args } = request.params;
 
         async function handleEmailAction(action: "send" | "draft", validatedArgs: any) {
@@ -459,7 +600,7 @@ async function main() {
                             .replace(/\//g, '_')
                             .replace(/=+$/, '');
 
-                        const result = await gmail.users.messages.send({
+                        const result = await g.users.messages.send({
                             userId: 'me',
                             requestBody: {
                                 raw: encodedMessage,
@@ -487,7 +628,7 @@ async function main() {
                             ...(validatedArgs.threadId && { threadId: validatedArgs.threadId })
                         };
                         
-                        const response = await gmail.users.drafts.create({
+                        const response = await g.users.drafts.create({
                             userId: 'me',
                             requestBody: {
                                 message: messageRequest,
@@ -527,7 +668,7 @@ async function main() {
                     }
 
                     if (action === "send") {
-                        const response = await gmail.users.messages.send({
+                        const response = await g.users.messages.send({
                             userId: 'me',
                             requestBody: messageRequest,
                         });
@@ -540,7 +681,7 @@ async function main() {
                             ],
                         };
                     } else {
-                        const response = await gmail.users.drafts.create({
+                        const response = await g.users.drafts.create({
                             userId: 'me',
                             requestBody: {
                                 message: messageRequest,
@@ -607,7 +748,7 @@ async function main() {
 
                 case "read_email": {
                     const validatedArgs = ReadEmailSchema.parse(args);
-                    const response = await gmail.users.messages.get({
+                    const response = await g.users.messages.get({
                         userId: 'me',
                         id: validatedArgs.messageId,
                         format: 'full',
@@ -672,7 +813,7 @@ async function main() {
 
                 case "search_emails": {
                     const validatedArgs = SearchEmailsSchema.parse(args);
-                    const response = await gmail.users.messages.list({
+                    const response = await g.users.messages.list({
                         userId: 'me',
                         q: validatedArgs.query,
                         maxResults: validatedArgs.maxResults || 10,
@@ -681,7 +822,7 @@ async function main() {
                     const messages = response.data.messages || [];
                     const results = await Promise.all(
                         messages.map(async (msg) => {
-                            const detail = await gmail.users.messages.get({
+                            const detail = await g.users.messages.get({
                                 userId: 'me',
                                 id: msg.id!,
                                 format: 'metadata',
@@ -728,7 +869,7 @@ async function main() {
                         requestBody.removeLabelIds = validatedArgs.removeLabelIds;
                     }
                     
-                    await gmail.users.messages.modify({
+                    await g.users.messages.modify({
                         userId: 'me',
                         id: validatedArgs.messageId,
                         requestBody: requestBody,
@@ -746,7 +887,7 @@ async function main() {
 
                 case "delete_email": {
                     const validatedArgs = DeleteEmailSchema.parse(args);
-                    await gmail.users.messages.delete({
+                    await g.users.messages.delete({
                         userId: 'me',
                         id: validatedArgs.messageId,
                     });
@@ -803,7 +944,7 @@ async function main() {
                         async (batch) => {
                             const results = await Promise.all(
                                 batch.map(async (messageId) => {
-                                    const result = await gmail.users.messages.modify({
+                                    const result = await g.users.messages.modify({
                                         userId: 'me',
                                         id: messageId,
                                         requestBody: requestBody,
@@ -850,7 +991,7 @@ async function main() {
                         async (batch) => {
                             const results = await Promise.all(
                                 batch.map(async (messageId) => {
-                                    await gmail.users.messages.delete({
+                                    await g.users.messages.delete({
                                         userId: 'me',
                                         id: messageId,
                                     });
@@ -960,7 +1101,7 @@ async function main() {
                 // Filter management handlers
                 case "create_filter": {
                     const validatedArgs = CreateFilterSchema.parse(args);
-                    const result = await createFilter(gmail, validatedArgs.criteria, validatedArgs.action);
+                    const result = await createFilter(g, validatedArgs.criteria, validatedArgs.action);
 
                     // Format criteria for display
                     const criteriaText = Object.entries(validatedArgs.criteria)
@@ -1096,7 +1237,7 @@ async function main() {
                             throw new Error(`Unknown template: ${template}`);
                     }
 
-                    const result = await createFilter(gmail, filterConfig.criteria, filterConfig.action);
+                    const result = await createFilter(g, filterConfig.criteria, filterConfig.action);
 
                     return {
                         content: [
@@ -1112,7 +1253,7 @@ async function main() {
                     
                     try {
                         // Get the attachment data from Gmail API
-                        const attachmentResponse = await gmail.users.messages.attachments.get({
+                        const attachmentResponse = await g.users.messages.attachments.get({
                             userId: 'me',
                             messageId: validatedArgs.messageId,
                             id: validatedArgs.attachmentId,
@@ -1132,7 +1273,7 @@ async function main() {
                         
                         if (!filename) {
                             // Get original filename from message if not provided
-                            const messageResponse = await gmail.users.messages.get({
+                            const messageResponse = await g.users.messages.get({
                                 userId: 'me',
                                 id: validatedArgs.messageId,
                                 format: 'full',
@@ -1198,9 +1339,140 @@ async function main() {
             };
         }
     });
+    }
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+    registerMcpHandlers(server);
+
+    function createMcpServer(): Server {
+        const s = new Server(
+            { name: "gmail", version: "1.0.0" },
+            { capabilities: { tools: {} } }
+        );
+        registerMcpHandlers(s);
+        return s;
+    }
+
+    interface SessionState {
+        server: Server;
+        transport: StreamableHTTPServerTransport;
+    }
+    const sessions = new Map<string, SessionState>();
+
+    function isInitializePayload(payload: unknown): boolean {
+        if (Array.isArray(payload)) {
+            return payload.some((m) => isInitializeRequest(m));
+        }
+        return isInitializeRequest(payload);
+    }
+
+    function createBadRequestResponse(message: string): object {
+        return {
+            jsonrpc: "2.0",
+            error: { code: -32000, message },
+            id: null,
+        };
+    }
+
+    async function getTransportForRequest(
+        req: express.Request,
+        requestBody: unknown
+    ): Promise<StreamableHTTPServerTransport | null> {
+        const sessionIdHeader = req.headers["mcp-session-id"];
+        const sessionId = typeof sessionIdHeader === "string" ? sessionIdHeader.trim() : null;
+
+        if (sessionId) {
+            const state = sessions.get(sessionId);
+            if (state) return state.transport;
+            return null;
+        }
+        if (req.method !== "POST" || !isInitializePayload(requestBody)) {
+            return null;
+        }
+        const newSessionId = uuidv4();
+        const sessionServer = createMcpServer();
+        const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => newSessionId,
+            enableDnsRebindingProtection: ENABLE_DNS_REBINDING_PROTECTION,
+            allowedHosts: ALLOWED_HOSTS.length ? ALLOWED_HOSTS : undefined,
+            allowedOrigins: ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : undefined,
+        });
+        transport.onclose = () => sessions.delete(newSessionId);
+        transport.onerror = (err: Error) => console.error("Streamable HTTP transport error", err.message);
+        await sessionServer.connect(transport);
+        sessions.set(newSessionId, { server: sessionServer, transport });
+        return transport;
+    }
+
+    function installGracefulShutdown(httpServer: import("http").Server): void {
+        let shutdownStarted = false;
+        const shutdown = async (signal: string) => {
+            if (shutdownStarted) return;
+            shutdownStarted = true;
+            for (const [, state] of sessions.entries()) {
+                try {
+                    await state.transport.close();
+                } catch (_) {}
+            }
+            sessions.clear();
+            await server.close();
+            await new Promise<void>((resolve, reject) => {
+                httpServer.close((err) => (err ? reject(err) : resolve()));
+            });
+            process.exit(0);
+        };
+        process.on("SIGINT", () => void shutdown("SIGINT"));
+        process.on("SIGTERM", () => void shutdown("SIGTERM"));
+    }
+
+    async function startHttpServer(): Promise<void> {
+        if (!Number.isInteger(HTTP_PORT) || HTTP_PORT < 1 || HTTP_PORT > 65535) {
+            throw new Error(`Invalid GMAIL_MCP_PORT: ${process.env.GMAIL_MCP_PORT}`);
+        }
+        const app = express();
+        app.use(express.json({ limit: "4mb" }));
+
+        app.get("/healthz", (_req, res) => {
+            res.status(200).json({ status: "ok", sessions: sessions.size });
+        });
+
+        const handleMcpRequest = async (req: express.Request, res: express.Response): Promise<void> => {
+            try {
+                const transport = await getTransportForRequest(req, req.body);
+                if (!transport) {
+                    const sessionId = req.headers["mcp-session-id"];
+                    const message = sessionId
+                        ? "Bad Request: Unknown or expired session. Send an initialize request to start a new session."
+                        : "Bad Request: Server not initialized. Send an initialize request first.";
+                    res.status(400).json(createBadRequestResponse(message));
+                    return;
+                }
+                await transport.handleRequest(req, res, req.body);
+            } catch (error) {
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        jsonrpc: "2.0",
+                        error: { code: -32603, message: "Internal server error" },
+                        id: null,
+                    });
+                }
+            }
+        };
+
+        app.post(HTTP_PATH, handleMcpRequest);
+        app.get(HTTP_PATH, handleMcpRequest);
+        app.delete(HTTP_PATH, handleMcpRequest);
+
+        await new Promise<void>((resolve, reject) => {
+            const httpServer = app.listen(HTTP_PORT, HTTP_HOST, () => {
+                installGracefulShutdown(httpServer);
+                console.error("Gmail MCP Streamable HTTP server listening", { host: HTTP_HOST, port: HTTP_PORT, path: HTTP_PATH });
+                resolve();
+            });
+            httpServer.on("error", reject);
+        });
+    }
+
+    await startHttpServer();
 }
 
 main().catch((error) => {
