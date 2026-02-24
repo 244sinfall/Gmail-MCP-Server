@@ -55,6 +55,35 @@ function escapeHtml(s: string): string {
         .replace(/'/g, "&#39;");
 }
 
+/** Write tokens to TOKEN_PATH; on EACCES/ENOENT ensure dir exists and retry; fallback to cwd/tokens.json if needed. */
+function writeTokensToFile(tokens: object): void {
+    const payload = JSON.stringify(tokens, null, 2);
+    const tryWrite = (filePath: string) => {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, payload, { mode: 0o600 });
+    };
+    try {
+        tryWrite(TOKEN_PATH);
+    } catch (err: any) {
+        const isAccessError = err?.code === "EACCES" || err?.code === "ENOENT";
+        if (isAccessError) {
+            try {
+                tryWrite(TOKEN_PATH);
+            } catch (retryErr: any) {
+                const fallback = path.join(process.cwd(), "tokens.json");
+                console.error("Could not write tokens to", TOKEN_PATH, retryErr?.message || retryErr, "- trying", fallback);
+                try {
+                    tryWrite(fallback);
+                } catch (fallbackErr: any) {
+                    console.error("Could not write tokens to fallback", fallback, fallbackErr?.message || fallbackErr, "- tokens are in memory only.");
+                }
+            }
+        } else {
+            throw err;
+        }
+    }
+}
+
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
     partId?: string;
@@ -198,13 +227,12 @@ function setupTokenRefreshPersistence() {
                 ...newTokens,
                 refresh_token: newTokens.refresh_token || current.refresh_token,
             };
-            fs.writeFileSync(TOKEN_PATH, JSON.stringify(updated, null, 2), { mode: 0o600 });
-            console.error('Tokens updated and saved to', TOKEN_PATH);
+            writeTokensToFile(updated);
+            console.error('Tokens updated and saved');
         } catch (err: any) {
-            if (err?.code === 'ENOENT') {
+            if (err?.code === 'ENOENT' || err?.code === 'EACCES') {
                 try {
-                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
-                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(newTokens, null, 2), { mode: 0o600 });
+                    writeTokensToFile(newTokens);
                 } catch (e) {
                     console.error('Error saving initial tokens:', e);
                 }
@@ -259,9 +287,19 @@ async function loadCredentials() {
             usingEnvTokens = true;
             oauth2Client.setCredentials(envTokens);
             console.error('Tokens loaded from environment.');
-        } else if (fs.existsSync(TOKEN_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
-            oauth2Client.setCredentials(credentials);
+        } else {
+            try {
+                if (fs.existsSync(TOKEN_PATH)) {
+                    const credentials = JSON.parse(fs.readFileSync(TOKEN_PATH, 'utf8'));
+                    oauth2Client.setCredentials(credentials);
+                }
+            } catch (err: any) {
+                if (err?.code === 'EACCES' || err?.code === 'ENOENT') {
+                    console.error('Could not read tokens file (first auth or permission issue). Proceeding without saved tokens.');
+                } else {
+                    throw err;
+                }
+            }
         }
     } catch (error) {
         console.error('Error loading credentials:', error);
@@ -302,8 +340,7 @@ async function authenticate() {
                 const { tokens } = await oauth2Client.getToken(code);
                 oauth2Client.setCredentials(tokens);
                 if (!usingEnvTokens) {
-                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
-                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+                    writeTokensToFile(tokens);
                 }
 
                 res.writeHead(200);
@@ -1482,8 +1519,7 @@ async function main() {
                 const { tokens } = await oauth2Client.getToken(code);
                 oauth2Client.setCredentials(tokens);
                 if (!usingEnvTokens) {
-                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
-                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+                    writeTokensToFile(tokens);
                 }
                 res.status(200).send(
                     "<!DOCTYPE html><html><body><h1>Authentication successful</h1><p>Tokens saved. You can close this window.</p></body></html>"

@@ -17,6 +17,8 @@ COPY --from=build /app/dist ./dist
 
 RUN mkdir -p /config
 
+RUN mkdir -p /mnt/auth
+
 ENV NODE_ENV=production
 ENV GMAIL_OAUTH_PATH=/config/gcp-oauth.keys.json
 ENV GMAIL_MCP_TOKEN_PATH=/config/tokens.json
@@ -26,5 +28,7 @@ ENV GMAIL_MCP_PORT=3000
 EXPOSE 3000
 
 USER node
+
+RUN chmod -R 777 /mnt/auth
 
 ENTRYPOINT ["node", "dist/index.js", "start"]
