@@ -46,6 +46,15 @@ const ALLOWED_ORIGINS = (process.env.GMAIL_MCP_ALLOWED_ORIGINS || '')
   .map((v) => v.trim())
   .filter(Boolean);
 
+function escapeHtml(s: string): string {
+    return s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
     partId?: string;
@@ -230,9 +239,13 @@ async function loadCredentials() {
             keys = parseKeys(keysContent);
         }
 
-        const callback = process.argv[2] === 'auth' && process.argv[3]
-            ? process.argv[3]
-            : 'http://localhost:3000/oauth2callback';
+        const callback =
+            process.env.GMAIL_OAUTH_REDIRECT_URI
+            || (process.argv[2] === 'auth' && process.argv[3]
+                ? process.argv[3]
+                : process.env.GMAIL_MCP_PORT
+                    ? `http://127.0.0.1:${process.env.GMAIL_MCP_PORT}/oauth2callback`
+                    : 'http://localhost:3000/oauth2callback');
 
         oauth2Client = new OAuth2Client(
             keys.client_id,
@@ -1433,6 +1446,54 @@ async function main() {
 
         app.get("/healthz", (_req, res) => {
             res.status(200).json({ status: "ok", sessions: sessions.size });
+        });
+
+        // In-app OAuth: serve consent entrypoint and callback, write tokens to GMAIL_MCP_TOKEN_PATH
+        const GMAIL_SCOPES = [
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.settings.basic",
+        ];
+
+        app.get("/auth", (_req, res) => {
+            const authUrl = oauth2Client.generateAuthUrl({
+                access_type: "offline",
+                scope: GMAIL_SCOPES,
+                prompt: "consent",
+            });
+            res.redirect(302, authUrl);
+        });
+
+        app.get("/oauth2callback", async (req, res) => {
+            const code = req.query.code as string | undefined;
+            const errorQuery = req.query.error as string | undefined;
+            if (errorQuery) {
+                res.status(400).send(
+                    `<!DOCTYPE html><html><body><h1>Authentication failed</h1><p>Error: ${escapeHtml(String(errorQuery))}</p></body></html>`
+                );
+                return;
+            }
+            if (!code) {
+                res.status(400).send(
+                    "<!DOCTYPE html><html><body><h1>Missing code</h1><p>No authorization code received.</p></body></html>"
+                );
+                return;
+            }
+            try {
+                const { tokens } = await oauth2Client.getToken(code);
+                oauth2Client.setCredentials(tokens);
+                if (!usingEnvTokens) {
+                    fs.mkdirSync(path.dirname(TOKEN_PATH), { recursive: true });
+                    fs.writeFileSync(TOKEN_PATH, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+                }
+                res.status(200).send(
+                    "<!DOCTYPE html><html><body><h1>Authentication successful</h1><p>Tokens saved. You can close this window.</p></body></html>"
+                );
+            } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                res.status(500).send(
+                    `<!DOCTYPE html><html><body><h1>Authentication failed</h1><p>${escapeHtml(msg)}</p></body></html>`
+                );
+            }
         });
 
         const handleMcpRequest = async (req: express.Request, res: express.Response): Promise<void> => {

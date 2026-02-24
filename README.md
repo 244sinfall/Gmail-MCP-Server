@@ -44,6 +44,8 @@ A Model Context Protocol (MCP) server for Gmail integration with auto authentica
    ```
 4. Health check: `curl http://127.0.0.1:3000/healthz`
 
+**In-app OAuth (when server is already running):** Open `http://127.0.0.1:3000/auth` in a browser to start the Google consent flow. After login, the callback at `/oauth2callback` exchanges the code and writes tokens to `GMAIL_MCP_TOKEN_PATH`. Ensure your Google OAuth client has redirect URI `http://127.0.0.1:3000/oauth2callback` (or set `GMAIL_OAUTH_REDIRECT_URI` to match your server URL).
+
 ## Installation & Authentication
 
 ### Installing via Smithery
