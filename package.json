@@ -22,7 +22,7 @@
   "bugs": {"url": "https://github.com/gongrzhe/server-gmail-autoauth-mcp/issues"},
   "homepage": "https://github.com/gongrzhe/server-gmail-autoauth-mcp#readme",
   "publishConfig": {"access": "public"},
-  "engines": {"node": ">=14.0.0"},
+  "engines": {"node": ">=20.0.0"},
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.16.0",
     "@types/mime-types": "^2.1.4",
